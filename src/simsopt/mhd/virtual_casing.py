@@ -20,8 +20,6 @@ from datetime import datetime
 import numpy as np
 from scipy.io import netcdf_file
 
-from .vmec_diagnostics import B_cartesian
-from .vmec import Vmec
 from ..geo.surfacerzfourier import SurfaceRZFourier
 from ..geo.surface import best_nphi_over_ntheta
 
@@ -160,6 +158,8 @@ class VirtualCasing:
               where ``<extension>`` is the string associated with Vmec input and output
               files, analogous to the Vmec output file ``"wout_<extension>.nc"``.
         """
+        from .vmec_diagnostics import B_cartesian
+        from .vmec import Vmec
         import virtual_casing as vc_module
 
         if not isinstance(vmec, Vmec):
@@ -252,6 +252,7 @@ class VirtualCasing:
         Bexternal_normal = np.sum(Bexternal3d * unit_normal, axis=2)
 
         vc = cls()
+        vc.mhd_solver = 0
         vc.src_ntheta = src_ntheta
         vc.src_nphi = src_nphi
         vc.src_theta = surf.quadpoints_theta
@@ -283,6 +284,160 @@ class VirtualCasing:
 
         return vc
 
+    @classmethod
+    def from_gvec(
+        cls,
+        gvec,
+        src_nphi: int,
+        src_ntheta: int,
+        use_stellsym: bool = True,
+        digits: int = 6,
+        filename: str = "auto"
+        ):
+        """
+        Given a :obj:`~simsopt.mhd.gvec.Gvec` object, compute the contribution
+        to the total magnetic field due to currents outside the plasma.
+
+        This function requires the python ``virtual_casing`` package to be
+        installed.
+
+        The argument ``src_nphi`` refers to the number of points around a half
+        field period if stellarator symmetry is exploited, or a full field
+        period if not.
+
+        Args:
+            Gvec: Either an instance of :obj:`simsopt.mhd.gvec.Gvec` or a `gvec.state`.
+            src_nphi: Number of grid points toroidally for the input of the calculation.
+            src_ntheta: Number of grid points poloidally for the input of the calculation.
+            use_stellsym: whether to exploit stellarator symmetry in the calculation.
+            digits: Approximate number of digits of precision for the calculation.
+            filename: If not ``None``, the results of the virtual casing calculation
+              will be saved in this file. For the default value of ``"auto"``, the
+              filename will automatically be set to ``"vcasing_<extension>.nc"``
+              where ``<extension>`` is the ProjectName of the gvec object.
+        """
+        from .gvec import Gvec
+        from gvec import State, Run
+        import virtual_casing as vc_module
+
+        match gvec:
+            case Gvec():
+                state = gvec.state()
+            case State():
+                state = gvec
+            case Run():
+                state = gvec.state
+            case _:
+                raise TypeError("gvec object is not of type Gvec, gvec.Run or gvec.State!")
+
+        nfp = state.nfp
+        zeta_points  = np.zeros(src_nphi)
+
+        # generate grid-points with the shift as,
+        # expected by the virtual casing. 
+        if use_stellsym:
+            counter = 0.5
+            shift = np.pi / nfp*(2*nfp-1) # shift to last half-field period
+            factor = np.pi # half-period: [0,1] -> [0,pi]
+        else:
+            counter = 1.0
+            shift = np.pi / nfp*(2*nfp-2)  # shift to last field period
+            factor = 2*np.pi # field-period: [0,1] -> [0,2*pi]
+        
+        for i in range(src_nphi):
+            zeta_points[i] = counter/(nfp*src_nphi)
+            counter +=1
+        zeta_points *= factor
+        zeta_points += shift
+
+        # ToDo: Why???
+        if not use_stellsym:#vmec.wout.lasym:
+            raise RuntimeError('virtual casing presently only works for stellarator symmetry')
+
+        # calculate the magnetic field B, the carthesian coordinates and the surface normal vector from gvec
+        # .transpose ensures the proper ordering
+        ev = state.evaluate(
+            "B", "grad_rho",
+            rho=1.0, theta=src_ntheta, zeta=zeta_points
+            ).sel(rho=1.0)
+        xyz = ev.pos.transpose("tor","pol","xyz").data
+        B_mhd = ev.B.transpose("tor","pol","xyz").data
+
+
+        unit_normal = ev.grad_rho / np.sqrt((ev.grad_rho**2).sum("xyz"))
+        unit_normal = np.flipud(unit_normal.transpose("tor","pol","xyz").data)
+
+        # need to flip mesh for the vmec counter clockwise direction
+        xyz = np.flipud(xyz)
+        B_mhd = np.flipud(B_mhd)
+        B1d = np.zeros(src_nphi * src_ntheta * 3)
+        gamma1d = np.zeros(src_nphi * src_ntheta * 3)
+        for jxyz in range(3):
+            gamma1d[jxyz * src_nphi * src_ntheta: (jxyz + 1) * src_nphi * src_ntheta] = xyz[:, :, jxyz].flatten(order='C')
+            B1d[jxyz * src_nphi * src_ntheta: (jxyz + 1) * src_nphi * src_ntheta] = B_mhd[:,:,jxyz].flatten(order='C')
+        
+        # The following is basically the same as for from_vmec:
+        # =============================================================
+        vcasing = vc_module.VirtualCasing()
+        vcasing.setup(
+            digits, nfp, use_stellsym,
+            src_nphi, src_ntheta, gamma1d,
+            src_nphi, src_ntheta,
+            src_nphi, src_ntheta)
+        
+        # This next line launches the main computation:
+        Bexternal1d = np.array(vcasing.compute_external_B(B1d))
+
+        # Unpack 1D array results:
+        Bexternal3d = np.zeros((src_nphi, src_ntheta, 3))
+        for jxyz in range(3):
+            Bexternal3d[:, :, jxyz] = Bexternal1d[
+                jxyz * src_nphi * src_ntheta: (jxyz + 1) * src_nphi * src_ntheta
+                ].reshape((src_nphi, src_ntheta), order='C')
+
+        Bexternal_normal = np.sum(Bexternal3d * unit_normal, axis=2)
+
+        vc = cls()
+        vc.mhd_solver = 1
+        vc.src_ntheta = src_ntheta
+        vc.src_nphi = src_nphi
+        vc.src_theta = ev.theta.data
+        vc.src_phi = np.flipud(ev.zeta.data) # to account for the flipud in B/xyz  
+
+        # ============================================================
+
+        # ToDo: figure out where vcasing does the traget calculations
+        # That is, find: trgt_theta, trgt_phi
+
+
+        vc.nfp = nfp
+        vc.B_total = B_mhd
+        vc.gamma = xyz
+        vc.unit_normal = unit_normal
+        vc.B_external = Bexternal3d
+        vc.B_external_normal = Bexternal_normal
+        vc.trgt_ntheta = src_ntheta
+        vc.trgt_nphi = src_nphi
+
+        Bexternal_normal_with_last_point = np.hstack((Bexternal_normal, Bexternal_normal[:, [0]]))
+        Bexternal_normal_with_last_point = np.vstack((Bexternal_normal_with_last_point, -np.flip(np.flip(Bexternal_normal_with_last_point, axis=0), axis=1)[0]))
+        flipped_B = -np.flip(np.flip(Bexternal_normal_with_last_point, axis=0), axis=1)
+        vc.B_external_normal_extended = np.concatenate([np.concatenate((Bexternal_normal, flipped_B[:-1, :-1])) for i in range(nfp)])
+
+        if filename is not None:
+            if filename == 'auto':
+                directory = state.statefile.parent
+                if "projectname" in state.parameters:
+                    projectname = state.parameters["projectname"]
+                else:
+                    projectname = "GVEC"
+                filename = directory / ("vacasing_" + projectname +".nc")
+                logger.debug(f'New filename: {filename}')
+            vc.save(filename)
+
+        return vc
+    
+
     def save(self, filename="vcasing.nc"):
         """
         Save the results of a virtual casing calculation in a NetCDF file.
@@ -298,6 +453,11 @@ class VirtualCasing:
             f.createDimension('trgt_nphi', self.trgt_nphi)
             f.createDimension('trgt_nphi_extended', self.trgt_nphi * 2 * self.nfp)
             f.createDimension('xyz', 3)
+
+            mhd_solver = f.createVariable('mhd_solver', 'i', tuple())
+            mhd_solver.data[()] = self.mhd_solver
+            mhd_solver.description = 'Indicates the MHD solver from which the virtual casing was calculated. 0: VMEC, 1: GVEC'
+            mhd_solver.units = 'Dimensionless'
 
             src_ntheta = f.createVariable('src_ntheta', 'i', tuple())
             src_ntheta.data[()] = self.src_ntheta
@@ -329,20 +489,22 @@ class VirtualCasing:
             src_theta.description = 'Grid points in the poloidal angle theta for source B field and surface shape. Note that theta extends over [0, 1) not [0, 2pi).'
             src_theta.units = 'Dimensionless'
 
-            trgt_theta = f.createVariable('trgt_theta', 'd', ('trgt_ntheta',))
-            trgt_theta[:] = self.trgt_theta
-            trgt_theta.description = 'Grid points in the poloidal angle theta for resulting B_external. Note that theta extends over [0, 1) not [0, 2pi).'
-            trgt_theta.units = 'Dimensionless'
+            if self.mhd_solver != 1: # not GVEC
+                trgt_theta = f.createVariable('trgt_theta', 'd', ('trgt_ntheta',))
+                trgt_theta[:] = self.trgt_theta
+                trgt_theta.description = 'Grid points in the poloidal angle theta for resulting B_external. Note that theta extends over [0, 1) not [0, 2pi).'
+                trgt_theta.units = 'Dimensionless'
 
             src_phi = f.createVariable('src_phi', 'd', ('src_nphi',))
             src_phi[:] = self.src_phi
             src_phi.description = 'Grid points in the toroidal angle phi for source B field and surface shape. Note that phi extends over [0, 1) not [0, 2pi).'
             src_phi.units = 'Dimensionless'
 
-            trgt_phi = f.createVariable('trgt_phi', 'd', ('trgt_nphi',))
-            trgt_phi[:] = self.trgt_phi
-            trgt_phi.description = 'Grid points in the toroidal angle phi for resulting B_external. Note that phi extends over [0, 1) not [0, 2pi).'
-            trgt_phi.units = 'Dimensionless'
+            if self.mhd_solver != 1: # not GVEC
+                trgt_phi = f.createVariable('trgt_phi', 'd', ('trgt_nphi',))
+                trgt_phi[:] = self.trgt_phi
+                trgt_phi.description = 'Grid points in the toroidal angle phi for resulting B_external. Note that phi extends over [0, 1) not [0, 2pi).'
+                trgt_phi.units = 'Dimensionless'
 
             gamma = f.createVariable('gamma', 'd', ('src_nphi', 'src_ntheta', 'xyz'))
             gamma[:, :, :] = self.gamma

@@ -78,6 +78,7 @@ class Gvec(Optimizable):
         pressure: the prescribed pressure profile.
         iota: the prescribed (or initial) rotational transform profile.
         current: the prescribed toroidal current profile. if None, GVEC will run in iota-constraint mode, otherwise it will run in current-constraint mode with the given iota as initial guess.
+        average_axis: If True, always utilize the initial guess for the magnetic axis obtained via `init_average_axis`.
         parameters: a dictionary of GVEC parameters.
         restart_file: path to a GVEC Statefile to restart from.
         delete_intermediates: whether to delete intermediate files after the run.
@@ -91,6 +92,7 @@ class Gvec(Optimizable):
         pressure: Optional[Profile] = None,
         iota: Union[Profile, float, None] = None,
         current: Union[Profile, float, None] = None,
+        average_axis: bool = True,
         parameters: Mapping = {},
         restart_file: Union[str, Path, None] = None,
         delete_intermediates: bool = False,
@@ -103,6 +105,7 @@ class Gvec(Optimizable):
         self.delete_intermediates = delete_intermediates
         self.keep_gvec_intermediates = keep_gvec_intermediates
         self.mpi = mpi
+        self.average_axis = average_axis
 
         if self.restart_file and not self.restart_file.exists():
             raise FileNotFoundError(f"Restart file {self.restart_file} not found")
@@ -296,7 +299,12 @@ class Gvec(Optimizable):
             if key in params:
                 params[key] = str(Path(params[key]).absolute())
 
-        params = self.boundary_to_params(boundary, params)
+        if self.restart_file:
+            average_axis = False
+        else:
+            average_axis = self.average_axis
+
+        params = self.boundary_to_params(boundary, params, average_axis=average_axis)
 
         # perturb boundary when restarting
         if self.restart_file:  # ToDo: check how perturbation interacts with run_stages (wait for gvec update of current_constraint fix)
@@ -368,7 +376,7 @@ class Gvec(Optimizable):
         return profile
     
     @staticmethod
-    def boundary_to_params(boundary: SurfaceRZFourier, append: Optional[Mapping] = None) -> dict:
+    def boundary_to_params(boundary: SurfaceRZFourier, append: Optional[Mapping] = None, average_axis: bool = True) -> dict:
         """Convert a simsopt.SurfaceRZFourier object into GVEC boundary parameters.
         
         The output parameters will include the (non-boundary) contents of the `append` dictionary, if provided.
@@ -379,7 +387,6 @@ class Gvec(Optimizable):
             params = copy.deepcopy(append)
 
         params["nfp"] = boundary.nfp
-        params["init_average_axis"] = True
 
         # keep higher mn_max if set previously (e.g. for interior modes)
         for key in ["X1", "X2", "LA"]:
@@ -389,10 +396,23 @@ class Gvec(Optimizable):
         params["X1_sin_cos"] = "_cos_" if boundary.stellsym else "_sin_cos_"
         params["X2_sin_cos"] = "_sin_" if boundary.stellsym else "_sin_cos_"
                 
-        for Xi in ["X1", "X2"]:
-            for ab in ["a", "b"]:
+        for Xi in ["X1_b", "X2_b"]:
+            for sincos in ["sin", "cos"]:
+                params[f"{Xi}_{sincos}"] = {}
+
+        if average_axis:
+            params["init_average_axis"] = True
+            for Xi in ["X1_a", "X2_a"]:
                 for sincos in ["sin", "cos"]:
-                    params[f"{Xi}_{ab}_{sincos}"] = {}
+                    params[f"{Xi}_{sincos}"] = {}
+        else:
+            params["init_average_axis"] = False
+            # flip X2_a due to additional flip via flip boundary
+            for mode in params["X2_a_sin"]:
+                params["X2_a_sin"][mode] = -params["X2_a_sin"][mode]
+            for Xi in ["X1_a_sin", "X2_a_cos"]:
+                    params[Xi] = {}
+
         for m in range(boundary.mpol + 1):
             for n in range(-boundary.ntor, boundary.ntor + 1):
                 if X1c := boundary.get_rc(m, n):
