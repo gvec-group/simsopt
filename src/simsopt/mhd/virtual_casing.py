@@ -290,9 +290,12 @@ class VirtualCasing:
         gvec,
         src_nphi: int,
         src_ntheta: int,
+        trgt_nphi: int | None = None,
+        trgt_ntheta: int | None = None,
         use_stellsym: bool = True,
         digits: int = 6,
-        filename: str = "auto"
+        filename: str = "auto",
+        clockwise_phi: bool | None = None,
         ):
         """
         Given a :obj:`~simsopt.mhd.gvec.Gvec` object, compute the contribution
@@ -309,12 +312,19 @@ class VirtualCasing:
             Gvec: Either an instance of :obj:`simsopt.mhd.gvec.Gvec` or a `gvec.state`.
             src_nphi: Number of grid points toroidally for the input of the calculation.
             src_ntheta: Number of grid points poloidally for the input of the calculation.
+            trgt_nphi: Number of grid points toroidally for the output of the calculation.
+              If unspecified, ``src_nphi`` will be used.
+            trgt_ntheta: Number of grid points poloidally for the output of the calculation.
+              If unspecified, ``src_ntheta`` will be used.
             use_stellsym: whether to exploit stellarator symmetry in the calculation.
             digits: Approximate number of digits of precision for the calculation.
             filename: If not ``None``, the results of the virtual casing calculation
               will be saved in this file. For the default value of ``"auto"``, the
               filename will automatically be set to ``"vcasing_<extension>.nc"``
               where ``<extension>`` is the ProjectName of the gvec object.
+            clockwise_phi: Whether the zeta direction is clockwise or counter clockwise.
+              If unspecified, will be inferred from the zeta=0.0 plane. Assumes that
+              the zeta=0.0 plane is not orthogonal to the x-z plane.
         """
         from .gvec import Gvec
         from gvec import State, Run
@@ -331,25 +341,39 @@ class VirtualCasing:
                 raise TypeError("gvec object is not of type Gvec, gvec.Run or gvec.State!")
 
         nfp = state.nfp
-        zeta_points  = np.zeros(src_nphi)
 
-        # generate grid-points with the shift as,
-        # expected by the virtual casing. 
-        if use_stellsym:
-            counter = 0.5
-            shift = np.pi / nfp*(2*nfp-1) # shift to last half-field period
-            factor = np.pi # half-period: [0,1] -> [0,pi]
+        if trgt_nphi is None:
+            trgt_nphi = src_nphi
+        if trgt_ntheta is None:
+            trgt_ntheta = src_ntheta
+
+        # we have to ensure a counter clockwise zeta direction as in VMEC?
+        # gvec zeta typically is -phi, but need not be due to its hmap.
+        # However, the coodrinate system is always right-handed
+        if clockwise_phi is None:
+            ev = state.evaluate("grad_zeta", rho=0.0, theta=0.0, zeta=0.0)
+            if ev.grad_zeta.sel(xyz="y").data > 0.0:
+                clockwise_phi = False
+            else:
+                clockwise_phi = True
+
+        if clockwise_phi:
+            factor = -1.0  
         else:
-            counter = 1.0
-            shift = np.pi / nfp*(2*nfp-2)  # shift to last field period
-            factor = 2*np.pi # field-period: [0,1] -> [0,2*pi]
-        
-        for i in range(src_nphi):
-            zeta_points[i] = counter/(nfp*src_nphi)
-            counter +=1
-        zeta_points *= factor
-        zeta_points += shift
+            factor = 1.0
 
+        if use_stellsym:
+            factor *= np.pi # half-period: [0,1] -> [0,pi]
+            src_zeta_points = np.linspace(1 / (2 * nfp * src_nphi), (src_nphi - 0.5) / (src_nphi * nfp), src_nphi)
+            trgt_zeta_points = np.linspace(1 / (2 * nfp * trgt_nphi), (trgt_nphi - 0.5) / (trgt_nphi * nfp), trgt_nphi)
+        else:
+            src_zeta_points = np.linspace(0, 1 / nfp, src_nphi,endpoint=False)
+            trgt_zeta_points = np.linspace(0, 1 / nfp, trgt_nphi,endpoint=False)
+            factor *= 2*np.pi # field-period: [0,1] -> [0,2*pi]
+        
+        src_zeta_points *= factor
+        trgt_zeta_points *= factor
+        
         # ToDo: Why???
         if not use_stellsym:#vmec.wout.lasym:
             raise RuntimeError('virtual casing presently only works for stellarator symmetry')
@@ -357,19 +381,24 @@ class VirtualCasing:
         # calculate the magnetic field B, the carthesian coordinates and the surface normal vector from gvec
         # .transpose ensures the proper ordering
         ev = state.evaluate(
-            "B", "grad_rho",
-            rho=1.0, theta=src_ntheta, zeta=zeta_points
+            "B",
+            rho=1.0,
+            theta=src_ntheta,
+            zeta=src_zeta_points
             ).sel(rho=1.0)
+        grad_rho = state.evaluate(
+            "grad_rho", rho=1.0,
+            theta=trgt_ntheta,
+            zeta=trgt_zeta_points
+            ).grad_rho.sel(rho=1.0)
         xyz = ev.pos.transpose("tor","pol","xyz").data
         B_mhd = ev.B.transpose("tor","pol","xyz").data
 
 
-        unit_normal = ev.grad_rho / np.sqrt((ev.grad_rho**2).sum("xyz"))
-        unit_normal = np.flipud(unit_normal.transpose("tor","pol","xyz").data)
+        unit_normal = grad_rho / np.sqrt((grad_rho**2).sum("xyz"))
+        unit_normal = unit_normal.transpose("tor","pol","xyz").data
 
-        # need to flip mesh for the vmec counter clockwise direction
-        xyz = np.flipud(xyz)
-        B_mhd = np.flipud(B_mhd)
+        
         B1d = np.zeros(src_nphi * src_ntheta * 3)
         gamma1d = np.zeros(src_nphi * src_ntheta * 3)
         for jxyz in range(3):
@@ -383,17 +412,15 @@ class VirtualCasing:
             digits, nfp, use_stellsym,
             src_nphi, src_ntheta, gamma1d,
             src_nphi, src_ntheta,
-            src_nphi, src_ntheta)
+            trgt_nphi, trgt_ntheta)
         
         # This next line launches the main computation:
         Bexternal1d = np.array(vcasing.compute_external_B(B1d))
 
         # Unpack 1D array results:
-        Bexternal3d = np.zeros((src_nphi, src_ntheta, 3))
+        Bexternal3d = np.zeros((trgt_nphi, trgt_ntheta, 3))
         for jxyz in range(3):
-            Bexternal3d[:, :, jxyz] = Bexternal1d[
-                jxyz * src_nphi * src_ntheta: (jxyz + 1) * src_nphi * src_ntheta
-                ].reshape((src_nphi, src_ntheta), order='C')
+            Bexternal3d[:, :, jxyz] = Bexternal1d[jxyz * trgt_nphi * trgt_ntheta: (jxyz + 1) * trgt_nphi * trgt_ntheta].reshape((trgt_nphi, trgt_ntheta), order='C')
 
         Bexternal_normal = np.sum(Bexternal3d * unit_normal, axis=2)
 
@@ -401,14 +428,15 @@ class VirtualCasing:
         vc.mhd_solver = 1
         vc.src_ntheta = src_ntheta
         vc.src_nphi = src_nphi
-        vc.src_theta = ev.theta.data
-        vc.src_phi = np.flipud(ev.zeta.data) # to account for the flipud in B/xyz  
 
         # ============================================================
 
-        # ToDo: figure out where vcasing does the traget calculations
-        # That is, find: trgt_theta, trgt_phi
+        vc.src_theta = ev.theta.data / (2*np.pi)
+        vc.trgt_theta = grad_rho.theta.data / (2*np.pi)
 
+        # the division by 2pi ensures consistency with vmec output so that phi is mapped from [0,2pi] -> [0,1]
+        vc.src_phi = ev.zeta.data / (2*np.pi)
+        vc.trgt_phi = grad_rho.zeta.data / (2*np.pi)
 
         vc.nfp = nfp
         vc.B_total = B_mhd
@@ -416,13 +444,17 @@ class VirtualCasing:
         vc.unit_normal = unit_normal
         vc.B_external = Bexternal3d
         vc.B_external_normal = Bexternal_normal
-        vc.trgt_ntheta = src_ntheta
-        vc.trgt_nphi = src_nphi
+        vc.trgt_ntheta = trgt_ntheta
+        vc.trgt_nphi = trgt_nphi
 
         Bexternal_normal_with_last_point = np.hstack((Bexternal_normal, Bexternal_normal[:, [0]]))
-        Bexternal_normal_with_last_point = np.vstack((Bexternal_normal_with_last_point, -np.flip(np.flip(Bexternal_normal_with_last_point, axis=0), axis=1)[0]))
+        Bexternal_normal_with_last_point = np.vstack(
+            (Bexternal_normal_with_last_point, -np.flip(np.flip(Bexternal_normal_with_last_point, axis=0), axis=1)[0])
+            )
         flipped_B = -np.flip(np.flip(Bexternal_normal_with_last_point, axis=0), axis=1)
-        vc.B_external_normal_extended = np.concatenate([np.concatenate((Bexternal_normal, flipped_B[:-1, :-1])) for i in range(nfp)])
+        vc.B_external_normal_extended = np.concatenate(
+            [np.concatenate((Bexternal_normal, flipped_B[:-1, :-1])) for i in range(nfp)]
+            )
 
         if filename is not None:
             if filename == 'auto':
@@ -500,11 +532,10 @@ class VirtualCasing:
             src_phi.description = 'Grid points in the toroidal angle phi for source B field and surface shape. Note that phi extends over [0, 1) not [0, 2pi).'
             src_phi.units = 'Dimensionless'
 
-            if self.mhd_solver != 1: # not GVEC
-                trgt_phi = f.createVariable('trgt_phi', 'd', ('trgt_nphi',))
-                trgt_phi[:] = self.trgt_phi
-                trgt_phi.description = 'Grid points in the toroidal angle phi for resulting B_external. Note that phi extends over [0, 1) not [0, 2pi).'
-                trgt_phi.units = 'Dimensionless'
+            trgt_phi = f.createVariable('trgt_phi', 'd', ('trgt_nphi',))
+            trgt_phi[:] = self.trgt_phi
+            trgt_phi.description = 'Grid points in the toroidal angle phi for resulting B_external. Note that phi extends over [0, 1) not [0, 2pi).'
+            trgt_phi.units = 'Dimensionless'
 
             gamma = f.createVariable('gamma', 'd', ('src_nphi', 'src_ntheta', 'xyz'))
             gamma[:, :, :] = self.gamma
