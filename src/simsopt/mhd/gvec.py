@@ -327,7 +327,7 @@ class Gvec(Optimizable):
             fig = self._runobj.plot_diagnostics_minimization()
             fig.savefig(self.rundir / "iterations.png")
             plt.close(fig)
-        except RuntimeError as e:
+        except Exception as e:
             logger.error(f"GVEC failed with: {e}")
             if not self.keep_failures:
                 self._rundir_deletion_list.append(self.rundir)
