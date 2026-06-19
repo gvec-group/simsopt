@@ -707,33 +707,48 @@ class GVECQuantity(Optimizable):
         self.quantity = quantity
         self.sfl = sfl
         self.kwargs = kwargs
+        self._cache = None
 
         super().__init__(depends_on=[eq])
-
+    
     @property
-    def ev(self):
-        """
-        Evaluate the specified quantity from the GVEC state.
+    def Q(self):
+        """The DataArray containing the evaluated quantity."""
+        if self._cache is None:
+            try:
+                if self.sfl is None:
+                    self._cache = self.eq.state.evaluate(self.quantity, **self.kwargs)[self.quantity]
+                else:
+                    self._cache = self.eq.state.evaluate_sfl(
+                        self.quantity, sfl=self.sfl, **self.kwargs
+                    )[self.quantity]
+            except Exception as e:
+                msg = f"Failed to evaluate quantity '{self.quantity}' from GVEC state"
+                logger.error(f"{msg}: {e}")
+                raise ObjectiveFailure(f"{msg}.") from e
+        return self._cache
 
-        Returns:
-            The evaluated quantity as an xarray.Dataset.
-        """
-        if self.sfl is None:
-            return self.eq.state.evaluate(self.quantity, **self.kwargs)
-        else:
-            return self.eq.state.evaluate_sfl(
-                self.quantity, sfl=self.sfl, **self.kwargs
-            )
+    def recompute_bell(self, parent=None):
+        """Set the recomputation flag"""
+        self._cache = None
 
     def J(self) -> np.ndarray:
         """Target function, returns a flattened array of the evaluated quantity."""
-        return self.ev[self.quantity].data.flatten()
+        return self.Q.data.flatten()
 
     def rms(self) -> float:
         """Root mean square of the evaluated quantity."""
-        return np.sqrt(np.mean(self.ev[self.quantity] ** 2)).item()
+        return np.sqrt(np.mean(self.Q**2)).item()
 
-    return_fn_map = {"J": J, "rms": rms}
+    def max(self) -> float:
+        """Maximum of the evaluated quantity."""
+        return self.Q.max().item()
+
+    def min(self) -> float:
+        """Minimum of the evaluated quantity."""
+        return self.Q.min().item()
+
+    return_fn_map = {"J": J, "rms": rms, "max": max, "min": min}
 
 
 class Elongation(Optimizable):
