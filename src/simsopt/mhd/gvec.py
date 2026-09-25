@@ -734,7 +734,7 @@ class GVECQuantity(Optimizable):
 
     def J(self) -> np.ndarray:
         """Target function, returns a flattened array of the evaluated quantity."""
-        return self.Q.data.flatten()
+        return self.Q.data.flatten().squeeze()
 
     def rms(self) -> float:
         """Root mean square of the evaluated quantity."""
